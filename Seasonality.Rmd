@@ -1,0 +1,146 @@
+---
+title: "Sales Weekly Seasonality"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+This notebook is updated on `r Sys.time()`
+
+Loading data and function...
+
+```{r}
+library(RODBC)
+library(dplyr)
+library(RCurl)
+deseason_func = getURL("https://raw.githubusercontent.com/ddizhang/handyR/master/timeSeries/deseason.R")
+eval(parse(text = deseason_func))
+
+
+dbhandle <- odbcDriverConnect('driver={SQL Server}; server=dc1sql27; trusted_connection=true')
+sales = sqlQuery(dbhandle, '
+                  SELECT fiscal_week
+                  ,SUM(SOMTotal) TtlSales
+                  FROM gxwizmo_10..GXSOM gx
+                  LEFT JOIN misc_10..LU_DATE dt 
+                  ON CONVERT(DATE, gx.SOMDateTime) = CONVERT(DATE, dt.cal_DATE)
+                  WHERE CONVERT(DATE, SOMDateTime) >= DATEADD(WEEK, -210, GETDATE())
+                  GROUP BY fiscal_week
+                  ORDER BY fiscal_week
+                  ')
+
+odbcClose(dbhandle)
+
+# Data manipulation
+sales = sales[-1, ] #exclude first week: might be incomplete
+sales = sales[-nrow(sales),] # exclude last week: might be incomplete
+sales = sales %>% filter(fiscal_week %% 100 < 53) #exclude week 53
+
+```
+
+
+
+
+
+```{r setup, include=FALSE}
+
+#' De-seasonality a ts object
+#'
+#' call R internal function 'stl' to deseasonize the series.
+#' When type = "a", 'stl' is applied normally (additively).
+#' When type = "m", natral logarism is applied to original series to get multiplicative seasonal indexs
+#' when series has exacctly 2 periods, one additional obs will be generated to ensure computation then deleted.
+#'
+#' @param y a ts object
+#' @param freq frequency
+#' @param s.window	in calling stl(): either the character string "periodic" or the span (in lags) of the loess window for seasonal extraction, which should be odd and at least 7, according to Cleveland et al. This has no default.
+#' @param type "multiplicative" or "additive"
+#' @return y.desea deseasonalized series
+#' @return sea.factor seasonal factors
+#' @export
+#'
+deseason = function(y,  swindow = "periodic", type = "a", ...)
+{
+  if (!"ts" %in% class(y)) stop("In deseason: Input should be a ts object!")
+  if (!type %in% c("a", "m"))
+    stop("wrong 'type' parameter!")
+
+  freq = frequency(y)
+  start = start(y)
+
+  if (length(y) < 2*freq)
+  {
+    warning("Deseasonalization not done: Length of time series should be no less than 2 periods!")
+    return(y)
+  }
+  makeup = 0
+  if (length(y) == 2*freq)
+  {
+    y = ts(c(y, mean(y[1], y[1+freq], y[2*freq])),frequency=freq)
+    makeup = 1
+  }
+  #stl is the critical library, it decompose a time series object
+  if (type == "a")
+  {
+    sea = stl(y, s.window = swindow, ...)
+    y.desea = sea$time.series[,2]+sea$time.series[,3]
+    sea.factor = sea$time.series[,1]
+  }
+  # m is just log the object and then do the decomposition
+  else if (type == "m")
+  {
+    sea = stl(log(y), s.window = swindow, ...)
+    y.desea = exp(sea$time.series[,2]+sea$time.series[,3]) # and make exponation to get back
+    sea.factor = exp(sea$time.series[,1])
+  }
+
+  if (makeup == 1)
+  {
+    y.desea = ts(y.desea[1:(2*freq)], frequency=freq, start = start)
+    sea.factor = ts(sea.factor[1:(2*freq)], frequency=freq, start = start)
+    
+  }
+
+
+  return(list(y.desea = y.desea, sea.factor = sea.factor))
+}
+
+#?stl
+```
+
+
+
+
+
+```{r}
+# De-seasonality
+sales.ts = ts(sales$TtlSales, frequency = 52, start = c(sales$fiscal_week[1]%/%100, sales$fiscal_week[1]%%100))
+sales.desea = deseason(sales.ts, type = "m")
+
+```
+
+```{r}
+sales.desea
+```
+
+
+```{r}
+# Visualize seasonality
+par(mfrow = c(2,1))
+plot(sales.ts, col = 'darkgrey', ylab = "", main = 'Sales Series')
+lines(sales.desea$y.desea, col = 'blue')
+plot(sales.desea$sea.factor, ylab = "", main = 'Sales Seasonal Factor')
+
+```
+
+```{r}
+# Get and Save seasonal factor
+seasonality = data.frame(week = sales$fiscal_week[1:52] %%100, sea.factor = sales.desea$sea.factor[1:52])
+
+
+seasonality <- rbind(seasonality, data.frame(week = 53, sea.factor = seasonality$sea.factor[seasonality$week == 52]))
+
+write.csv(seasonality, "Seasonality.csv")
+```
+
